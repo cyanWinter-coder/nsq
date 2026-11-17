@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
 	"net"
 	"os"
 	"strings"
@@ -35,6 +34,12 @@ func (p *LookupProtocolV1) IOLoop(c protocol.Client) error {
 	for {
 		line, err = reader.ReadString('\n')
 		if err != nil {
+			if err == io.EOF {
+				// clean disconnect, not an error condition
+				err = nil
+			} else {
+				err = fmt.Errorf("failed to read command - %s", err)
+			}
 			break
 		}
 
@@ -247,7 +252,10 @@ func (p *LookupProtocolV1) IDENTIFY(client *ClientV1, reader *bufio.Reader, para
 	data["version"] = version.Binary
 	hostname, err := os.Hostname()
 	if err != nil {
-		log.Fatalf("ERROR: unable to get hostname %s", err)
+		// a failure to resolve the local hostname should not be fatal
+		// to the daemon, log it and continue with an empty hostname
+		p.nsqlookupd.logf(LOG_ERROR, "CLIENT(%s): failed to get hostname - %s", client, err)
+		hostname = ""
 	}
 	data["broadcast_address"] = p.nsqlookupd.opts.BroadcastAddress
 	data["hostname"] = hostname

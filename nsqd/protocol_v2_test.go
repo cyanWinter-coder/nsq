@@ -1437,6 +1437,112 @@ func TestTLSSnappy(t *testing.T) {
 	test.Equal(t, []byte("OK"), data)
 }
 
+// ensure that when a consumer disconnects without FINishing its in-flight
+// messages, those messages are immediately requeued (per the
+// requeue-on-disconnect policy) and delivered to a reconnecting consumer
+func TestDisconnectRequeue(t *testing.T) {
+	opts := NewOptions()
+	opts.Logger = test.NewTestLogger(t)
+	opts.LogLevel = LOG_DEBUG
+	opts.MsgTimeout = time.Minute
+	opts.QueueScanRefreshInterval = 100 * time.Millisecond
+	tcpAddr, _, nsqd := mustStartNSQD(opts)
+	defer func() { _ = os.RemoveAll(opts.DataPath) }()
+	defer nsqd.Exit()
+
+	topicName := "test_disconnect_requeue" + strconv.Itoa(int(time.Now().Unix()))
+	topic := nsqd.GetTopic(topicName)
+	ch := topic.GetChannel("ch")
+
+	msgIDs := make(map[MessageID]struct{})
+	for i := 0; i < 2; i++ {
+		msg := NewMessage(topic.GenerateID(), []byte("test"))
+		msgIDs[msg.ID] = struct{}{}
+		err := topic.PutMessage(msg)
+		test.Nil(t, err)
+	}
+
+	// consumer 1 subscribes and receives both messages but never
+	// FINishes them before disconnecting
+	conn, err := mustConnectNSQD(tcpAddr)
+	test.Nil(t, err)
+
+	identify(t, conn, map[string]interface{}{
+		"msg_timeout": 60000,
+	}, frameTypeResponse)
+	sub(t, conn, topicName, "ch")
+
+	_, err = nsq.Ready(2).WriteTo(conn)
+	test.Nil(t, err)
+
+	for i := 0; i < 2; i++ {
+		resp, err := nsq.ReadResponse(conn)
+		test.Nil(t, err)
+		frameType, data, err := nsq.UnpackResponse(resp)
+		test.Nil(t, err)
+		test.Equal(t, frameTypeMessage, frameType)
+		msgOut, err := decodeMessage(data)
+		test.Nil(t, err)
+		_, ok := msgIDs[msgOut.ID]
+		test.Equal(t, true, ok)
+	}
+
+	// disconnect without FIN
+	_ = conn.Close()
+
+	// the in-flight messages should be requeued promptly, without
+	// waiting for the (1 minute) message timeout to expire
+	var depth int64
+	for i := 0; i < 100; i++ {
+		depth = ch.Depth()
+		if depth == 2 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	test.Equal(t, int64(2), depth)
+	test.Equal(t, 2, int(atomic.LoadUint64(&ch.requeueCount)))
+	test.Equal(t, 0, int(atomic.LoadUint64(&ch.timeoutCount)))
+
+	// consumer 2 reconnects and receives the requeued messages
+	conn, err = mustConnectNSQD(tcpAddr)
+	test.Nil(t, err)
+	defer func() { _ = conn.Close() }()
+
+	identify(t, conn, map[string]interface{}{
+		"msg_timeout": 60000,
+	}, frameTypeResponse)
+	sub(t, conn, topicName, "ch")
+
+	_, err = nsq.Ready(2).WriteTo(conn)
+	test.Nil(t, err)
+
+	for i := 0; i < 2; i++ {
+		resp, err := nsq.ReadResponse(conn)
+		test.Nil(t, err)
+		frameType, data, err := nsq.UnpackResponse(resp)
+		test.Nil(t, err)
+		test.Equal(t, frameTypeMessage, frameType)
+		msgOut, err := decodeMessage(data)
+		test.Nil(t, err)
+		_, ok := msgIDs[msgOut.ID]
+		test.Equal(t, true, ok)
+		// each redelivered message should have been attempted twice
+		test.Equal(t, uint16(2), msgOut.Attempts)
+		_, err = nsq.Finish(nsq.MessageID(msgOut.ID)).WriteTo(conn)
+		test.Nil(t, err)
+	}
+
+	for i := 0; i < 100; i++ {
+		depth = ch.Depth()
+		if depth == 0 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	test.Equal(t, int64(0), depth)
+}
+
 func TestClientMsgTimeout(t *testing.T) {
 	opts := NewOptions()
 	opts.Logger = test.NewTestLogger(t)

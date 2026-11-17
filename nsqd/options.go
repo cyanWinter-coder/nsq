@@ -55,6 +55,13 @@ type Options struct {
 	ClientTimeout   time.Duration
 	MaxDeferTimeout time.Duration `flag:"max-defer-timeout"`
 
+	// consumer disconnect policy
+	//
+	// when a consumer disconnects, immediately requeue its in-flight
+	// messages so they can be redelivered to other (or reconnecting)
+	// consumers without waiting for the message timeout to expire
+	RequeueOnDisconnect bool `flag:"requeue-on-disconnect" cfg:"requeue_on_disconnect"`
+
 	// client overridable configuration options
 	MaxHeartbeatInterval   time.Duration `flag:"max-heartbeat-interval"`
 	MaxRdyCount            int64         `flag:"max-rdy-count"`
@@ -161,6 +168,8 @@ func NewOptions() *Options {
 		MaxReqTimeout:   1 * time.Hour,
 		ClientTimeout:   60 * time.Second,
 		MaxDeferTimeout: 1 * time.Hour,
+
+		RequeueOnDisconnect: true,
 
 		MaxHeartbeatInterval:   60 * time.Second,
 		MaxRdyCount:            2500,

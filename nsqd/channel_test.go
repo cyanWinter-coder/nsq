@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -206,6 +207,147 @@ func TestMaxChannelConsumers(t *testing.T) {
 	client2.SetReadyCount(25)
 	err = channel.AddClient(client2.ID, client2)
 	test.NotEqual(t, err, nil)
+}
+
+// ensure that when a consumer disconnects its in-flight messages are
+// immediately requeued (per the requeue-on-disconnect policy) so that
+// other (or reconnecting) consumers can receive them without waiting
+// for the message timeout to expire
+func TestRequeueOnDisconnect(t *testing.T) {
+	count := 25
+
+	opts := NewOptions()
+	opts.Logger = test.NewTestLogger(t)
+	opts.MsgTimeout = time.Minute
+	tcpAddr, _, nsqd := mustStartNSQD(opts)
+	defer func() { _ = os.RemoveAll(opts.DataPath) }()
+	defer nsqd.Exit()
+
+	conn, _ := mustConnectNSQD(tcpAddr)
+	defer func() { _ = conn.Close() }()
+
+	topicName := "test_requeue_on_disconnect" + strconv.Itoa(int(time.Now().Unix()))
+	topic := nsqd.GetTopic(topicName)
+	channel := topic.GetChannel("channel")
+
+	client := newClientV2(1, conn, nsqd)
+	client.SetReadyCount(int64(count))
+	err := channel.AddClient(client.ID, client)
+	test.Nil(t, err)
+
+	for i := 0; i < count; i++ {
+		msg := NewMessage(topic.GenerateID(), []byte("test"))
+		err = channel.StartInFlightTimeout(msg, client.ID, opts.MsgTimeout)
+		test.Nil(t, err)
+		client.SendingMessage()
+	}
+
+	channel.inFlightMutex.Lock()
+	numInFlight := len(channel.inFlightMessages)
+	channel.inFlightMutex.Unlock()
+	test.Equal(t, count, numInFlight)
+	test.Equal(t, int64(0), channel.Depth())
+
+	// simulate the consumer disconnecting
+	channel.RemoveClient(client.ID)
+
+	channel.inFlightMutex.Lock()
+	numInFlight = len(channel.inFlightMessages)
+	channel.inFlightMutex.Unlock()
+	test.Equal(t, 0, numInFlight)
+
+	// all of the in-flight messages should have been immediately requeued
+	test.Equal(t, count, int(atomic.LoadUint64(&channel.requeueCount)))
+	test.Equal(t, int64(count), channel.Depth())
+
+	// the requeued messages should be deliverable to a new consumer
+	for i := 0; i < count; i++ {
+		select {
+		case <-channel.memoryMsgChan:
+		default:
+			t.Fatalf("expected message %d in memory queue", i)
+		}
+	}
+}
+
+// ensure that with the requeue-on-disconnect policy disabled, in-flight
+// messages of a disconnected consumer remain in-flight (until they timeout)
+func TestRequeueOnDisconnectDisabled(t *testing.T) {
+	count := 25
+
+	opts := NewOptions()
+	opts.Logger = test.NewTestLogger(t)
+	opts.MsgTimeout = time.Minute
+	opts.RequeueOnDisconnect = false
+	tcpAddr, _, nsqd := mustStartNSQD(opts)
+	defer func() { _ = os.RemoveAll(opts.DataPath) }()
+	defer nsqd.Exit()
+
+	conn, _ := mustConnectNSQD(tcpAddr)
+	defer func() { _ = conn.Close() }()
+
+	topicName := "test_requeue_on_disconnect_disabled" + strconv.Itoa(int(time.Now().Unix()))
+	topic := nsqd.GetTopic(topicName)
+	channel := topic.GetChannel("channel")
+
+	client := newClientV2(1, conn, nsqd)
+	client.SetReadyCount(int64(count))
+	err := channel.AddClient(client.ID, client)
+	test.Nil(t, err)
+
+	for i := 0; i < count; i++ {
+		msg := NewMessage(topic.GenerateID(), []byte("test"))
+		err = channel.StartInFlightTimeout(msg, client.ID, opts.MsgTimeout)
+		test.Nil(t, err)
+		client.SendingMessage()
+	}
+
+	channel.RemoveClient(client.ID)
+
+	channel.inFlightMutex.Lock()
+	numInFlight := len(channel.inFlightMessages)
+	channel.inFlightMutex.Unlock()
+	test.Equal(t, count, numInFlight)
+	test.Equal(t, 0, int(atomic.LoadUint64(&channel.requeueCount)))
+	test.Equal(t, int64(0), channel.Depth())
+}
+
+// ensure that deferred (timed) requeues are delivered back to the channel
+// once their timeout expires
+func TestDeferredRequeueWorker(t *testing.T) {
+	count := 100
+
+	opts := NewOptions()
+	opts.Logger = test.NewTestLogger(t)
+	opts.QueueScanRefreshInterval = 100 * time.Millisecond
+	_, _, nsqd := mustStartNSQD(opts)
+	defer func() { _ = os.RemoveAll(opts.DataPath) }()
+	defer nsqd.Exit()
+
+	topicName := "test_deferred_requeue_worker" + strconv.Itoa(int(time.Now().Unix()))
+	topic := nsqd.GetTopic(topicName)
+	channel := topic.GetChannel("channel")
+
+	for i := 0; i < count; i++ {
+		msg := NewMessage(topic.GenerateID(), []byte("test"))
+		err := channel.StartDeferredTimeout(msg, 100*time.Millisecond)
+		test.Nil(t, err)
+	}
+
+	channel.deferredMutex.Lock()
+	numDeferred := len(channel.deferredMessages)
+	channel.deferredMutex.Unlock()
+	test.Equal(t, count, numDeferred)
+
+	// the deferred worker has a resolution of 100ms so we need to wait
+	// at least that much longer than the timeout (in worst case)
+	time.Sleep(500 * time.Millisecond)
+
+	channel.deferredMutex.Lock()
+	numDeferred = len(channel.deferredMessages)
+	channel.deferredMutex.Unlock()
+	test.Equal(t, 0, numDeferred)
+	test.Equal(t, int64(count), channel.Depth())
 }
 
 func TestChannelHealth(t *testing.T) {

@@ -163,6 +163,9 @@ func nsqdFlagSet(opts *nsqd.Options) *flag.FlagSet {
 	flagSet.Int64("max-body-size", opts.MaxBodySize, "maximum size of a single command body")
 	flagSet.Duration("max-defer-timeout", opts.MaxDeferTimeout, "maximum duration when deferring a message")
 
+	// consumer disconnect policy
+	flagSet.Bool("requeue-on-disconnect", opts.RequeueOnDisconnect, "immediately requeue a consumer's in-flight messages when it disconnects")
+
 	// client overridable configuration options
 	flagSet.Duration("max-heartbeat-interval", opts.MaxHeartbeatInterval, "maximum client configurable duration of time between client heartbeats")
 	flagSet.Int64("max-rdy-count", opts.MaxRdyCount, "maximum RDY count for a client")

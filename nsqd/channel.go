@@ -506,6 +506,10 @@ func (c *Channel) RemoveClient(clientID int64) {
 		return
 	}
 
+	if c.nsqd.getOpts().RequeueOnDisconnect {
+		c.requeueClientInFlightMessages(clientID)
+	}
+
 	c.Lock()
 	delete(c.clients, clientID)
 	numClients := len(c.clients)
@@ -514,6 +518,43 @@ func (c *Channel) RemoveClient(clientID int64) {
 	if numClients == 0 && c.ephemeral {
 		go c.deleter.Do(func() { c.deleteCallback(c) })
 	}
+}
+
+// requeueClientInFlightMessages immediately requeues all in-flight messages
+// owned by clientID (ie. because the client disconnected) so that they can be
+// delivered to other (or reconnecting) consumers without waiting for the
+// message timeout to expire
+func (c *Channel) requeueClientInFlightMessages(clientID int64) int {
+	c.inFlightMutex.Lock()
+	var msgs []*Message
+	for id, msg := range c.inFlightMessages {
+		if msg.clientID != clientID {
+			continue
+		}
+		delete(c.inFlightMessages, id)
+		if msg.index != -1 {
+			// an index of -1 means the in-flight queue scanner has
+			// already popped this message off the pqueue and is in
+			// the process of requeuing it
+			c.inFlightPQ.Remove(msg.index)
+		}
+		msgs = append(msgs, msg)
+	}
+	c.inFlightMutex.Unlock()
+
+	for _, msg := range msgs {
+		atomic.AddUint64(&c.requeueCount, 1)
+		if err := c.put(msg); err != nil {
+			c.nsqd.logf(LOG_ERROR, "CHANNEL(%s): failed to requeue in-flight msg(%s) for disconnected client(%d) - %s",
+				c.name, msg.ID, clientID, err)
+		}
+	}
+
+	if len(msgs) > 0 {
+		c.nsqd.logf(LOG_INFO, "CHANNEL(%s): requeued %d in-flight messages for disconnected client(%d)",
+			c.name, len(msgs), clientID)
+	}
+	return len(msgs)
 }
 
 func (c *Channel) StartInFlightTimeout(msg *Message, clientID int64, timeout time.Duration) error {
